@@ -1,0 +1,51 @@
+# Python virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+
+# Packaging and build artifacts
+build/
+dist/
+site/
+*.egg
+*.egg-info/
+pip-wheel-metadata/
+
+# Test, coverage, and type-checker caches
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+.pytype/
+.ruff_cache/
+
+# Local environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Generated competitor analysis reports and assets
+/output/
+
+# Playwright-generated artifacts
+playwright-report/
+test-results/
+blob-report/
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
