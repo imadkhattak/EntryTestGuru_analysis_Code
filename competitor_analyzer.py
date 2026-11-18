@@ -22,6 +22,7 @@ import argparse
 import base64
 import html
 import json
+import os
 import re
 import time
 import urllib.robotparser
@@ -36,7 +37,7 @@ Image.MAX_IMAGE_PIXELS = None
 
 # True  = browser runs hidden in the background (default)
 # False = you can watch Chrome open and move through the site
-HEADLESS =  False
+HEADLESS = True
 
 SKIP_EXT = (".pdf", ".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp", ".zip",
             ".mp4", ".mp3", ".css", ".js", ".ico", ".xml", ".json")
@@ -119,12 +120,37 @@ EXTRACT_JS = """
 """
 
 
-def crawl(start_url, out_dir, max_pages, delay, headless, ignore_robots):
+SKIP_PATH = re.compile(r"logout|log-out|signout|sign-out|delete|checkout|payment|unsubscribe|remove", re.I)
+
+
+def try_auto_login(page):
+    """Fill the login form using env vars SITE_EMAIL / SITE_PASSWORD (never hard-code them)."""
+    email, pw = os.environ.get("SITE_EMAIL"), os.environ.get("SITE_PASSWORD")
+    if not (email and pw):
+        print("SITE_EMAIL / SITE_PASSWORD not set -> please log in manually.")
+        return
+    try:
+        page.locator('input[type="email"], input[name*="email" i], input[id*="email" i]').first.fill(email, timeout=8000)
+        page.locator('input[type="password"]').first.fill(pw, timeout=5000)
+        page.keyboard.press("Enter")
+        page.wait_for_load_state("networkidle", timeout=15000)
+        print("Auto-login submitted. Check the window to confirm you are logged in.")
+    except Exception as e:
+        print(f"Auto-login didn't work ({e}) -> please log in manually.")
+
+
+def crawl(start_url, out_dir, max_pages, delay, headless, ignore_robots, login_url=None,
+          allow_subdomains=False, per_host_limit=0, auto_login=False):
     shots_dir = out_dir / "screenshots"
     shots_dir.mkdir(parents=True, exist_ok=True)
 
     start = clean_url(start_url)
     domain = urlparse(start).netloc
+    root = ".".join(domain.split(".")[-2:])  # e.g. magoosh.com
+    host_count = {}
+
+    def host_ok(netloc):
+        return netloc == domain or (allow_subdomains and (netloc == root or netloc.endswith("." + root)))
 
     rp = urllib.robotparser.RobotFileParser()
     rp.set_url(f"{urlparse(start).scheme}://{domain}/robots.txt")
@@ -136,16 +162,36 @@ def crawl(start_url, out_dir, max_pages, delay, headless, ignore_robots):
     queue, seen, pages = deque([start]), {start}, []
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=headless)
-        ctx = browser.new_context(
-            viewport={"width": 1440, "height": 900},
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
-        )
-        page = ctx.new_page()
+        viewport = {"width": 1440, "height": 900}
+        if login_url:
+            # Manual login: you sign in yourself (e.g. "Continue with Google"),
+            # the session is saved in ./browser_profile so you only do it once.
+            try:  # prefer your real Chrome (Google is more accepting of it)
+                browser = pw.chromium.launch_persistent_context(
+                    "browser_profile", channel="chrome", headless=False, viewport=viewport)
+            except Exception:
+                browser = pw.chromium.launch_persistent_context(
+                    "browser_profile", headless=False, viewport=viewport)
+            page = browser.pages[0] if browser.pages else browser.new_page()
+            page.goto(login_url)
+            if auto_login:
+                try_auto_login(page)
+            input("\n>>> Log in in the browser window, wait until you see the "
+                  "dashboard, then press ENTER here to start... ")
+        else:
+            browser = pw.chromium.launch(headless=headless)
+            ctx = browser.new_context(
+                viewport=viewport,
+                user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+            )
+            page = ctx.new_page()
 
         while queue and len(pages) < max_pages:
             url = queue.popleft()
+            host = urlparse(url).netloc
+            if per_host_limit and host_count.get(host, 0) >= per_host_limit:
+                continue
             if rp and not ignore_robots and not rp.can_fetch("*", url):
                 print(f"[skip: robots.txt] {url}")
                 continue
@@ -166,12 +212,14 @@ def crawl(start_url, out_dir, max_pages, delay, headless, ignore_robots):
 
                 data.update(url=url, status=status, screenshot=str(shot_path))
                 pages.append(data)
+                host_count[host] = host_count.get(host, 0) + 1
 
                 for link in data["links"]:
                     link = clean_url(urljoin(url, link))
                     p = urlparse(link)
-                    if (p.netloc == domain and p.scheme in ("http", "https")
+                    if (host_ok(p.netloc) and p.scheme in ("http", "https")
                             and not p.path.lower().endswith(SKIP_EXT)
+                            and not SKIP_PATH.search(p.path)
                             and link not in seen):
                         seen.add(link)
                         queue.append(link)
@@ -304,6 +352,16 @@ def main():
     ap.add_argument("--max-pages", type=int, default=25)
     ap.add_argument("--delay", type=float, default=1.5, help="seconds between pages")
     ap.add_argument("--show-browser", action="store_true")
+    ap.add_argument("--all-subdomains", action="store_true",
+                    help="also follow links to other subdomains (gre.site.com, gmat.site.com ...)")
+    ap.add_argument("--per-host-limit", type=int, default=0,
+                    help="max pages per subdomain, so every test/product gets covered (0 = no limit)")
+    ap.add_argument("--auto-login", action="store_true",
+                    help="fill email/password from env vars SITE_EMAIL and SITE_PASSWORD (use with --login)")
+    ap.add_argument("--login", action="store_true",
+                    help="open the start URL first and pause so you can log in (e.g. with Google)")
+    ap.add_argument("--login-url", default=None,
+                    help="open this login page first so you can sign in manually (e.g. with Google)")
     ap.add_argument("--respect-robots", action="store_true",
                     help="check robots.txt before visiting pages (off by default)")
     args = ap.parse_args()
@@ -312,10 +370,13 @@ def main():
     out = Path("output") / domain
     out.mkdir(parents=True, exist_ok=True)
 
+    if (args.login or args.auto_login) and not args.login_url:
+        args.login_url = args.url  # site will redirect to its login page itself
     headless = HEADLESS and not args.show_browser
     print(f"Browser mode: {'hidden (headless)' if headless else 'visible'}")
     pages, all_links = crawl(args.url, out, args.max_pages, args.delay,
-                             headless, not args.respect_robots)
+                             headless, not args.respect_robots, args.login_url,
+                             args.all_subdomains, args.per_host_limit, args.auto_login)
     if not pages:
         print("No pages captured.")
         return
